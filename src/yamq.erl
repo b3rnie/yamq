@@ -142,8 +142,8 @@ q_load(Store) ->
   lists:foldl(fun({K,P,D}, Heads) -> q_insert(K,P,D,Heads) end, [], Keys).
 
 q_insert(K,P,D,Heads0) ->
-  Q = q_p2q(P),
-  Q = ets:insert_new(Q, {{D, K}, []}),
+  Q    = q_p2q(P),
+  true = ets:insert_new(Q, {{D, K}, []}),
   case lists:keytake(Q, 1, Heads0) of
     {value, {Q,DP}, Heads} -> [{Q,lists:min([DP|D])}|Heads];
     false                  -> [{Q,D}|Heads0]
@@ -205,10 +205,13 @@ w_loop(Store, Fun) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-start_stop_test() ->
-  yamq:start_link(),
-  yamq:stop().
-
+basic_test() ->
+  yamq_test:run(fun(Msg) -> ct:pal("~p", [Msg]) end,
+                fun() ->
+                    yamq:enqueue("test", 1, 10),
+                    yamq:enqueue("test_delay", 8, s2_time:stamp() + 1000000),
+                    timer:sleep(2000)
+                end).
 -endif.
 
 %%%_* Emacs ============================================================
