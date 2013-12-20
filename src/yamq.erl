@@ -28,15 +28,14 @@
 -include_lib("stdlib2/include/prelude.hrl").
 
 %%%_* Macros ===========================================================
--define(workers, 10).
 
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
--record(s, { store = throw('store')
-           , spids = throw('spids')
-           , wpids = throw('wpids')
-           , fpids = throw('fpids')
-           , heads = throw('heads')
+-record(s, { store    = throw('store')
+           , spids    = throw('spids')
+           , wpids    = throw('wpids')
+           , froms    = throw('fpids')
+           , heads    = throw('heads')
            }).
 
 %%%_ * API -------------------------------------------------------------
@@ -54,25 +53,25 @@ enqueue(X, P, D)
 %%%_ * gen_server callbacks --------------------------------------------
 init(Args) ->
   process_flag(trap_exit, true),
-  {ok, Fun}   = s2_lists:assoc(Args, 'fun'),
-  {ok, Store} = s2_lists:assoc(Args, 'store'),
+  {ok, Fun}     = s2_lists:assoc(Args, 'fun'),
+  {ok, Store}   = s2_lists:assoc(Args, 'store'),
+  {ok, Workers} = s2_lists:assoc(Args, 'workers'),
   _     = q_init(),
   Heads = q_load(Store),
-  Pids  = w_init(Store, Fun),
-  {ok, #s{ store = Store
-         , wpids = Pids
-         , fpids = []
-         , spids = []
-         , heads = Heads
+  WPids = w_init(Store, Fun, Workers),
+  {ok, #s{ store    = Store
+         , wpids    = WPids
+         , spids    = []
+         , froms    = []
+         , heads    = Heads
          }, wait([], Heads)}.
 
 terminate(_Rsn, _S) ->
   ok.
 
-handle_call({enqueue, X, P, D}, From, S) ->
+handle_call({enqueue, X, P, D}, From, #s{store=Store} = S) ->
   %% yes, we rely on time always moving forward..
   K     = s2_time:stamp(),
-  Store = S#s.store,
   Pid = spawn_link(
           fun() ->
               case Store:put({K,P,D}, X) of
@@ -84,18 +83,15 @@ handle_call({enqueue, X, P, D}, From, S) ->
                                 exit(store_failed)
               end
           end),
-  {noreply, S#s{spids=[{Pid,{K,P,D}}|S#s.spids]}, wait(S#s.fpids, S#s.heads)};
-handle_call(dequeue, From, #s{fpids=[]} = S) ->
+  {noreply, S#s{spids=[{Pid,{K,P,D}}|S#s.spids]}, wait(S#s.froms, S#s.heads)};
+handle_call(dequeue, From, S) ->
   case q_next(S#s.heads) of
     {ok, {{K,P,D}, Heads}} ->
-      {reply, {K,P,D}, S#s{heads=Heads}, wait(S#s.fpids, Heads)};
+      {reply, {K,P,D}, S#s{heads=Heads}, wait(S#s.froms, Heads)};
     {error, empty} ->
-      {noreply, S#s{fpids=[From]}, wait([From], S#s.heads)}
+      Froms = S#s.froms ++ [From],
+      {noreply, S#s{froms=Froms}, wait(Froms, S#s.heads)}
   end;
-handle_call(dequeue, From, S) ->
-  FPids = [From|S#s.fpids],
-  {noreply, S#s{fpids=FPids}, wait(FPids, S#s.heads)};
-
 handle_call(stop, _From, S) ->
   %% wait for workers
   {stop, normal, ok, S}.
@@ -110,24 +106,24 @@ handle_info({'EXIT', Pid, normal}, S) ->
   %% do we have a free worker?
   %% if so, hand it directly to worker and skip ets.
   Heads = q_insert(K,P,D,S#s.heads),
-  {noreply, S#s{spids=SPids, heads=Heads}, wait(S#s.fpids, Heads)};
+  {noreply, S#s{spids=SPids, heads=Heads}, wait(S#s.froms, Heads)};
 handle_info({'EXIT', _Pid, Rsn}, S) ->
   {stop, Rsn, S};
-handle_info(timeout, #s{fpids=[F|Fs]} = S) ->
+handle_info(timeout, #s{froms=[From|Froms]} = S) ->
   {ok, {{K,P,D},Heads}} = q_next(S#s.heads),
-  gen_server:reply(F, {K,P,D}),
-  {noreply, S#s{fpids=Fs, heads=Heads}, wait(Fs, Heads)};
+  gen_server:reply(From, {K,P,D}),
+  {noreply, S#s{froms=Froms, heads=Heads}, wait(Froms, Heads)};
 handle_info(Msg, S) ->
   ?warning("~p", [Msg]),
-  {noreply, S, wait(S#s.fpids, S#s.heads)}.
+  {noreply, S, wait(S#s.froms, S#s.heads)}.
 
 code_change(_OldVsn, S, _Extra) ->
-  {ok, S, wait(S#s.fpids, S#s.heads)}.
+  {ok, S, wait(S#s.froms, S#s.heads)}.
 
 %%%_ * Internals gen_server util ---------------------------------------
-wait([], _           ) -> infinity;
-wait(_,  []          ) -> infinity;
-wait(_,  [{_Q,DS}|Hs]) ->
+wait([],     _Heads       ) -> infinity;
+wait(_Froms, []           ) -> infinity;
+wait(_Froms, [{_QS,DS}|Hs]) ->
   Min = lists:foldl(fun({_Q, D},Acc) when D < Acc -> D;
                        ({_Q,_D},Acc)              -> Acc
                     end, DS, Hs),
@@ -168,11 +164,11 @@ q_pick(Ready) ->
 
 q_take_next(Q, Heads) ->
   {D,K} = ets:first(Q),
+  true  = ets:delete(Q, {D,K}),
   case ets:first(Q) of
     '$end_of_table' -> {ok, {{K,q_q2p(Q),D}, lists:keydelete(Q, 1, Heads)}};
     {ND,_NK}        -> {ok, {{K,q_q2p(Q),D}, lists:keyreplace(Q, 1, Heads, {Q,ND})}}
   end.
-  
 
 q_q2p('q1') -> 1;
 q_q2p('q2') -> 2;
@@ -193,10 +189,10 @@ q_p2q(7)    -> 'q7';
 q_p2q(8)    -> 'q8'.
 
 %%%_ * Internals workers -----------------------------------------------
-w_init(Store, Fun) ->
+w_init(Store, Fun, Workers) ->
   lists:map(fun(_) ->
                 erlang:spawn_link(fun() -> w_loop(Store, Fun) end)
-            end, lists:seq(1, ?workers)).
+            end, lists:seq(1, Workers)).
 
 w_loop(Store, Fun) ->
   {K,P,D} = gen_server:call(?MODULE, dequeue, infinity),
