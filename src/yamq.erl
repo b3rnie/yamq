@@ -242,6 +242,16 @@ priority_test() ->
                 end,
                 [{workers, 1}]).
 
+stop_wait_for_workers_test() ->
+  Daddy = self(),
+  yamq_test:run(fun(Msg) -> timer:sleep(1000), Daddy ! Msg, ok end,
+                fun() ->
+                    yamq:enqueue("1", 1, 0),
+                    timer:sleep(100),
+                    yamq:stop(),
+                    "1" = receive X -> X end
+                end).
+
 -endif.
 
 %%%_* Emacs ============================================================
