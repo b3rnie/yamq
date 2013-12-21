@@ -211,7 +211,9 @@ w_loop(Store, Fun) ->
 basic_test() ->
   yamq_test:run(fun(Msg) -> ct:pal("~p", [Msg]), ok end,
                 fun() ->
-                    yamq:enqueue("test", 1, 10),
+                    lists:foreach(fun(N) ->
+                                      ok = yamq:enqueue("test", N, 0)
+                                  end, lists:seq(1, 8)),
                     timer:sleep(1000)
                 end).
 
