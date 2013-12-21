@@ -147,8 +147,9 @@ q_insert(K,P,D,Heads0) ->
   Q    = q_p2q(P),
   true = ets:insert_new(Q, {{D, K}, []}),
   case lists:keytake(Q, 1, Heads0) of
-    {value, {Q,DP}, Heads} -> [{Q,lists:min([DP|D])}|Heads];
-    false                  -> [{Q,D}|Heads0]
+    {value, {Q,DP}, _Heads} when DP =< D -> Heads0;
+    {value, {Q,DP},  Heads} when DP >= D -> [{Q,D}|Heads];
+    false                                -> [{Q,D}|Heads0]
   end.
 
 q_next(Heads) ->
@@ -220,7 +221,7 @@ delay_test() ->
                 fun() ->
                     yamq:enqueue("1", 1, 3000000+s2_time:stamp()),
                     yamq:enqueue("2", 2, 2000000+s2_time:stamp()),
-                    yamq:enqueue("3", 3, 1000000+s2_time:stamp()),
+                    yamq:enqueue("3", 2, 1000000+s2_time:stamp()),
                     "3" = receive X -> X end,
                     "2" = receive Y -> Y end,
                     "1" = receive Z -> Z end
