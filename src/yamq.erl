@@ -31,11 +31,11 @@
 
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
--record(s, { store    = throw('store')
-           , spids    = throw('spids')
-           , wpids    = throw('wpids')
-           , froms    = throw('fpids')
-           , heads    = throw('heads')
+-record(s, { store = throw('store')
+           , spids = throw('spids')
+           , wpids = throw('wpids')
+           , froms = throw('froms')
+           , heads = throw('heads')
            }).
 
 %%%_ * API -------------------------------------------------------------
@@ -66,8 +66,10 @@ init(Args) ->
          , heads    = Heads
          }, wait([], Heads)}.
 
-terminate(_Rsn, _S) ->
-  ok.
+terminate(_Rsn, S) ->
+  lists:foreach(fun(Pid) ->
+                    receive {'$gen_call', {Pid,_}, dequeue} -> ok end
+                end, S#s.wpids -- [Pid || {Pid,_} <- S#s.froms]).
 
 handle_call({enqueue, X, P, D}, From, #s{store=Store} = S) ->
   %% yes, we rely on time always moving forward..
@@ -206,12 +208,40 @@ w_loop(Store, Fun) ->
 -include_lib("eunit/include/eunit.hrl").
 
 basic_test() ->
-  yamq_test:run(fun(Msg) -> ct:pal("~p", [Msg]) end,
+  yamq_test:run(fun(Msg) -> ct:pal("~p", [Msg]), ok end,
                 fun() ->
                     yamq:enqueue("test", 1, 10),
-                    yamq:enqueue("test_delay", 8, s2_time:stamp() + 1000000),
-                    timer:sleep(2000)
+                    timer:sleep(1000)
                 end).
+
+delay_test() ->
+  Daddy = self(),
+  yamq_test:run(fun(Msg) -> Daddy ! Msg, ok end,
+                fun() ->
+                    yamq:enqueue("1", 1, 3000000+s2_time:stamp()),
+                    yamq:enqueue("2", 2, 2000000+s2_time:stamp()),
+                    yamq:enqueue("3", 3, 1000000+s2_time:stamp()),
+                    "3" = receive X -> X end,
+                    "2" = receive Y -> Y end,
+                    "1" = receive Z -> Z end
+                end).
+
+priority_test() ->
+  Daddy = self(),
+  yamq_test:run(fun(Msg) -> timer:sleep(500), Daddy ! Msg,ok end,
+                fun() ->
+                    yamq:enqueue("1", 1, 0),
+                    timer:sleep(100),
+                    yamq:enqueue("2", 8, 0),
+                    yamq:enqueue("3", 7, 0),
+                    yamq:enqueue("4", 6, 0),
+                    "1" = receive X -> X end,
+                    "4" = receive Y -> Y end,
+                    "3" = receive Z -> Z end,
+                    "2" = receive N -> N end
+                end,
+                [{workers, 1}]).
+
 -endif.
 
 %%%_* Emacs ============================================================
