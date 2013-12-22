@@ -28,11 +28,11 @@
 %%%_* Code =============================================================
 %%%_ * API -------------------------------------------------------------
 start_link(File) -> gen_server:start_link({local, ?MODULE}, ?MODULE, [File], []).
-stop()           -> gen_server:call(?MODULE, stop).
-get(K)           -> gen_server:call(?MODULE, {get, K}).
-put(K,V)         -> gen_server:call(?MODULE, {put, K,V}).
-delete(K)        -> gen_server:call(?MODULE, {delete, K}).
-list()           -> gen_server:call(?MODULE, list).
+stop()           -> gen_server:call(?MODULE, stop, infinity).
+get(K)           -> gen_server:call(?MODULE, {get, K}, infinity).
+put(K,V)         -> gen_server:call(?MODULE, {put, K,V}, infinity).
+delete(K)        -> gen_server:call(?MODULE, {delete, K}, infinity).
+list()           -> gen_server:call(?MODULE, list, infinity).
 
 %%%_ * gen_server ------------------------------------------------------
 init([File]) ->
