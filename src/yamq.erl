@@ -95,7 +95,7 @@ handle_call({enqueue, X, P, D}, From, #s{store=Store} = S) ->
                                 %% Riak:
                                 %% might still be stored and might
                                 %% show up on later reads/index scans.
-                                exit(store_failed)
+                                exit(Rsn)
               end
           end),
   SPids = [{Pid,{K,P,D}}|S#s.spids],
@@ -130,9 +130,9 @@ handle_info({'EXIT', Pid, Rsn}, #s{wpids=WPids0} = S) ->
   case lists:delete(Pid, WPids0) of
     WPids0 -> {value, {Pid, _}, SPids} = lists:keytake(Pid, 1, S#s.spids),
               ?warning("writer died: ~p", [Rsn]),
-              {stop, Rsn, S#s{spids=SPids}};
+              {stop, {store_failed, Rsn}, S#s{spids=SPids}};
     WPids  -> ?warning("worker died: ~p", [Rsn]),
-              {stop, Rsn, S#s{wpids=WPids}}
+              {stop, {worker_failed, Rsn}, S#s{wpids=WPids}}
   end;
 handle_info(timeout, S) ->
   ?hence(S#s.wfree > 0),
@@ -252,17 +252,6 @@ basic_test() ->
                     'receive'([{basic, N} || N <- lists:seq(1,8)])
                 end).
 
-crash_test() ->
-  erlang:process_flag(trap_exit, true),
-  {ok, Pid1} = yamq_dets_store:start_link("x.dets"),
-  {ok, Pid2} = yamq:start_link([{workers, 1}, {func, fun(Msg) -> exit(Msg) end}, {store, yamq_dets_store}]),
-  ok = yamq:enqueue(oh_no, 1),
-  receive {'EXIT', Pid2, oh_no} -> ok end,
-  ok = yamq_dets_store:stop(),
-  receive {'EXIT', Pid1, normal} -> ok end,
-  erlang:process_flag(trap_exit, false),
-  ok.
-
 delay_test() ->
   Daddy = self(),
   yamq_test:run(fun(Msg) -> Daddy ! Msg, ok end,
@@ -337,6 +326,27 @@ init_test() ->
   {ok, _} = yamq:start_link([{workers, 1}, {func, fun(_) -> ok end}, {store, yamq_dets_store}]),
   ok = yamq:stop(),
   ok = yamq_dets_store:stop().
+
+crash_test() ->
+  erlang:process_flag(trap_exit, true),
+  {ok, Pid1} = yamq_dets_store:start_link("x.dets"),
+  {ok, Pid2} = yamq:start_link([{workers, 1}, {func, fun(Msg) -> exit(Msg) end}, {store, yamq_dets_store}]),
+  ok = yamq:enqueue(oh_no, 1),
+  receive {'EXIT', Pid2, {worker_failed, oh_no}} -> ok end,
+  ok = yamq_dets_store:stop(),
+  receive {'EXIT', Pid1, normal} -> ok end,
+  erlang:process_flag(trap_exit, false),
+  ok.
+
+store_fail_test() ->
+  erlang:process_flag(trap_exit, true),
+  {ok, _}   = yamq_dets_store:start_link("x.dets"),
+  {ok, Pid} = yamq:start_link([{workers, 1}, {func, fun(_) -> ok end}, {store, yamq_dets_store}]),
+  ok        = yamq_dets_store:stop(),
+  catch yamq:enqueue(store_fail_test, 1),
+  receive {'EXIT', Pid, {store_failed, _}} -> ok end,
+  erlang:process_flag(trap_exit, false),
+  ok.
 
 'receive'([]) -> ok;
 'receive'(L) ->
