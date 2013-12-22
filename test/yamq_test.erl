@@ -17,6 +17,6 @@ do_run(F,Args) ->
   catch yamq_dets_store:stop().
 
 def(F,A) ->
-    lists:ukeysort(1, [{'store',   'yamq_dets_store'},
-                       {'workers', 4},
-                       {'fun',     F}] ++ A).
+    lists:ukeysort(1, A ++ [{'store',   'yamq_dets_store'},
+                            {'workers', 4},
+                            {'fun',     F}]).
