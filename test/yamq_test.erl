@@ -19,4 +19,4 @@ do_run(F,Args) ->
 def(F,A) ->
     lists:ukeysort(1, A ++ [{'store',   'yamq_dets_store'},
                             {'workers', 4},
-                            {'fun',     F}]).
+                            {'func',    F}]).

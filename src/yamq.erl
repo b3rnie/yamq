@@ -33,9 +33,10 @@
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
 -record(s, { store = throw('store')
+           , func  = throw('func')
            , spids = throw('spids')
            , wpids = throw('wpids')
-           , froms = throw('froms')
+           , wfree = throw('wfree')
            , heads = throw('heads')
            }).
 
@@ -63,23 +64,23 @@ enqueue(X, P, D)
 %%%_ * gen_server callbacks --------------------------------------------
 init(Args) ->
   process_flag(trap_exit, true),
-  {ok, Fun}     = s2_lists:assoc(Args, 'fun'),
+  {ok, Func}    = s2_lists:assoc(Args, 'func'),
   {ok, Store}   = s2_lists:assoc(Args, 'store'),
   {ok, Workers} = s2_lists:assoc(Args, 'workers'),
   _     = q_init(),
   Heads = q_load(Store),
-  WPids = w_init(Store, Fun, Workers),
   {ok, #s{ store    = Store
-         , wpids    = WPids
+         , func     = Func
+         , wpids    = []
          , spids    = []
-         , froms    = []
+         , wfree    = Workers
          , heads    = Heads
-         }, wait([], Heads)}.
+         }, wait(Workers, Heads)}.
 
 terminate(_Rsn, S) ->
   lists:foreach(fun(Pid) ->
-                    receive {'$gen_call', {Pid,_}, dequeue} -> ok end
-                end, S#s.wpids -- [Pid || {Pid,_} <- S#s.froms]).
+                    receive {'EXIT', Pid, _Rsn} -> ok end
+                end, S#s.wpids).
 
 handle_call({enqueue, X, P, D}, From, #s{store=Store} = S) ->
   %% k needs to be:
@@ -97,52 +98,61 @@ handle_call({enqueue, X, P, D}, From, #s{store=Store} = S) ->
                                 exit(store_failed)
               end
           end),
-  {noreply, S#s{spids=[{Pid,{K,P,D}}|S#s.spids]}, wait(S#s.froms, S#s.heads)};
-handle_call(dequeue, From, S) ->
-  case q_next(S#s.heads) of
-    {ok, {{K,P,D}, Heads}} ->
-      {reply, {K,P,D}, S#s{heads=Heads}, wait(S#s.froms, Heads)};
-    {error, empty} ->
-      Froms = S#s.froms ++ [From],
-      {noreply, S#s{froms=Froms}, wait(Froms, S#s.heads)}
-  end;
+  SPids = [{Pid,{K,P,D}}|S#s.spids],
+  {noreply, S#s{spids=SPids}, wait(S#s.wfree, S#s.heads)};
 handle_call(stop, _From, S) ->
-  %% wait for workers
   {stop, normal, ok, S}.
 
 handle_cast(Msg, S) ->
   {stop, {bad_cast, Msg}, S}.
 
-handle_info({'EXIT', Pid, normal}, S) ->
-  {value, {Pid, {K,P,D}}, SPids} = lists:keytake(Pid, 1, S#s.spids),
-  %% TODO:
-  %% is it due?
-  %% do we have a free worker?
-  %% if so, hand it directly to worker and skip ets.
-  Heads = q_insert(K,P,D,S#s.heads),
-  {noreply, S#s{spids=SPids, heads=Heads}, wait(S#s.froms, Heads)};
+handle_info({'EXIT', Pid, normal}, #s{wpids=WPids0} = S) ->
+  case lists:delete(Pid, WPids0) of
+    WPids0 ->
+      {value, {Pid, {K,P,D}}, SPids} = lists:keytake(Pid, 1, S#s.spids),
+      Heads = q_insert(K,P,D,S#s.heads),
+      {noreply, S#s{spids = SPids,
+                    heads = Heads}, wait(S#s.wfree, Heads)};
+    WPids1 ->
+      case q_next(S#s.heads) of
+        {ok, {{K,P,D}, Heads}} ->
+          NPid  = w_spawn(S#s.store, S#s.func, {K,P,D}),
+          WPids = [NPid|WPids1],
+          {noreply, S#s{wpids = WPids,
+                        heads = Heads}, wait(S#s.wfree, Heads)};
+        {error, empty} ->
+          WFree = S#s.wfree+1,
+          {noreply, S#s{wfree = WFree,
+                        wpids = WPids1}, wait(WFree, S#s.heads)}
+      end
+  end;
 handle_info({'EXIT', _Pid, Rsn}, S) ->
   {stop, Rsn, S};
-handle_info(timeout, #s{froms=[From|Froms]} = S) ->
+handle_info(timeout, S) ->
+  ?hence(S#s.wfree > 0),
   case q_next(S#s.heads) of
     {ok, {{K,P,D},Heads}} ->
-      gen_server:reply(From, {K,P,D}),
-      {noreply, S#s{froms=Froms, heads=Heads}, wait(Froms, Heads)};
+      Pid   = w_spawn(S#s.store, S#s.func, {K,P,D}),
+      WFree = S#s.wfree - 1,
+      WPids = [Pid|S#s.wpids],
+      {noreply, S#s{wfree = WFree,
+                    wpids = WPids,
+                    heads = Heads}, wait(WFree, Heads)};
     {error, empty} ->
       %% hmm..
-      {noreply, S, wait(S#s.froms, S#s.heads)}
+      {noreply, S, wait(S#s.wfree, S#s.heads)}
   end;
 handle_info(Msg, S) ->
   ?warning("~p", [Msg]),
-  {noreply, S, wait(S#s.froms, S#s.heads)}.
+  {noreply, S, wait(S#s.wfree, S#s.heads)}.
 
 code_change(_OldVsn, S, _Extra) ->
   {ok, S}.
 
 %%%_ * Internals gen_server util ---------------------------------------
-wait([],     _Heads       ) -> infinity;
-wait(_Froms, []           ) -> infinity;
-wait(_Froms, [{_QS,DS}|Hs]) ->
+wait(0,      _Heads       ) -> infinity;
+wait(_WFree, []           ) -> infinity;
+wait(_WFree, [{_QS,DS}|Hs]) ->
   case lists:foldl(fun({_Q, D},Acc) when D < Acc -> D;
                       ({_Q,_D},Acc)              -> Acc
                    end, DS, Hs) of
@@ -160,7 +170,9 @@ q_init() ->
 
 q_load(Store) ->
   {ok, Keys} = Store:list(),
-  lists:foldl(fun({K,P,D}, Heads) -> q_insert(K,P,D,Heads) end, [], Keys).
+  lists:foldl(fun({K,P,D}, Heads) ->
+                  q_insert(K,P,D,Heads)
+              end, [], Keys).
 
 q_insert(K,P,D,Heads0) ->
   Q    = q_p2q(P),
@@ -182,12 +194,13 @@ q_pick(Ready) ->
   [{Q,_}|_] = lists:sort(Ready),
   Q.
 
-q_take_next(Q, Heads) ->
+q_take_next(Q, Heads0) ->
   {D,K} = ets:first(Q),
   true  = ets:delete(Q, {D,K}),
+  Heads = lists:keydelete(Q, 1, Heads0),
   case ets:first(Q) of
-    '$end_of_table' -> {ok, {{K,q_q2p(Q),D}, lists:keydelete(Q, 1, Heads)}};
-    {ND,_NK}        -> {ok, {{K,q_q2p(Q),D}, lists:keyreplace(Q, 1, Heads, {Q,ND})}}
+    '$end_of_table' -> {ok, {{K,q_q2p(Q),D}, Heads}};
+    {ND,_NK}        -> {ok, {{K,q_q2p(Q),D}, [{Q,ND}|Heads]}}
   end.
 
 %% queue to priority
@@ -211,17 +224,13 @@ q_p2q(7) -> 'q7';
 q_p2q(8) -> 'q8'.
 
 %%%_ * Internals workers -----------------------------------------------
-w_init(Store, Fun, Workers) ->
-  lists:map(fun(_) ->
-                erlang:spawn_link(fun() -> w_loop(Store, Fun) end)
-            end, lists:seq(1, Workers)).
-
-w_loop(Store, Fun) ->
-  {K,P,D} = gen_server:call(?MODULE, dequeue, infinity),
-  {ok, X} = Store:get({K,P,D}),
-  ok      = Fun(X),
-  ok      = Store:delete({K,P,D}),
-  w_loop(Store, Fun).
+w_spawn(Store, Fun, {K,P,D}) ->
+  erlang:spawn_link(
+    fun() ->
+        {ok, X} = Store:get({K,P,D}),
+        ok      = Fun(X),
+        ok      = Store:delete({K,P,D})
+    end).
 
 %%%_* Tests ============================================================
 -ifdef(TEST).
@@ -276,6 +285,7 @@ cover_test() ->
   yamq_test:run(fun(_) -> ok end,
                 fun() ->
                     yamq ! foo,
+                    yamq ! timeout,
                     ok = sys:suspend(yamq),
                     ok = sys:change_code(yamq, yamq, 0, []),
                     ok = sys:resume(yamq),
