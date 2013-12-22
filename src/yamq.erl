@@ -126,8 +126,14 @@ handle_info({'EXIT', Pid, normal}, #s{wpids=WPids0} = S) ->
                         wpids = WPids1}, wait(WFree, S#s.heads)}
       end
   end;
-handle_info({'EXIT', _Pid, Rsn}, S) ->
-  {stop, Rsn, S};
+handle_info({'EXIT', Pid, Rsn}, #s{wpids=WPids0} = S) ->
+  case lists:delete(Pid, WPids0) of
+    WPids0 -> {value, {Pid, _}, SPids} = lists:keytake(Pid, 1, S#s.spids),
+              ?warning("writer died: ~p", [Rsn]),
+              {stop, Rsn, S#s{spids=SPids}};
+    WPids  -> ?warning("worker died: ~p", [Rsn]),
+              {stop, Rsn, S#s{wpids=WPids}}
+  end;
 handle_info(timeout, S) ->
   ?hence(S#s.wfree > 0),
   case q_next(S#s.heads) of
@@ -237,37 +243,48 @@ w_spawn(Store, Fun, {K,P,D}) ->
 -include_lib("eunit/include/eunit.hrl").
 
 basic_test() ->
-  yamq_test:run(fun(Msg) -> ct:pal("~p", [Msg]), ok end,
+  Daddy = self(),
+  yamq_test:run(fun(Msg) -> Daddy ! Msg, ok end,
                 fun() ->
                     lists:foreach(fun(N) ->
-                                      ok = yamq:enqueue("test", N)
+                                      ok = yamq:enqueue({basic, N}, N)
                                   end, lists:seq(1, 8)),
-                    timer:sleep(1000)
+                    'receive'([{basic, N} || N <- lists:seq(1,8)])
                 end).
+
+crash_test() ->
+  erlang:process_flag(trap_exit, true),
+  {ok, Pid1} = yamq_dets_store:start_link("x.dets"),
+  {ok, Pid2} = yamq:start_link([{workers, 1}, {func, fun(Msg) -> exit(Msg) end}, {store, yamq_dets_store}]),
+  ok = yamq:enqueue(oh_no, 1),
+  receive {'EXIT', Pid2, oh_no} -> ok end,
+  ok = yamq_dets_store:stop(),
+  receive {'EXIT', Pid1, normal} -> ok end,
+  erlang:process_flag(trap_exit, false),
+  ok.
 
 delay_test() ->
   Daddy = self(),
   yamq_test:run(fun(Msg) -> Daddy ! Msg, ok end,
                 fun() ->
-                    yamq:enqueue(1, 1, 2000),
-                    yamq:enqueue(2, 1, 1000),
-                    yamq:enqueue(3, 1, 3000),
-                    yamq:enqueue(4, 2, 500),
-                    yamq:enqueue(5, 2, 4000),
-                    receive_in_order([4,2,1,3,5]),
-                    timer:sleep(100)
+                    ok = yamq:enqueue({delay, 1}, 1, 2000),
+                    ok = yamq:enqueue({delay, 2}, 1, 1000),
+                    ok = yamq:enqueue({delay, 3}, 1, 3000),
+                    ok = yamq:enqueue({delay, 4}, 2, 500),
+                    ok = yamq:enqueue({delay, 5}, 2, 4000),
+                    receive_in_order([{delay, N} || N <- [4,2,1,3,5]])
                 end).
 
 priority_test() ->
   Daddy = self(),
   yamq_test:run(fun(Msg) -> timer:sleep(400), Daddy ! Msg,ok end,
                 fun() ->
-                    yamq:enqueue(1, 1),
+                    yamq:enqueue({priority_test, 1}, 1),
                     timer:sleep(100),
                     lists:foreach(fun(P) ->
-                                      yamq:enqueue(P,P)
+                                      yamq:enqueue({priority_test,P},P)
                                   end, lists:reverse(lists:seq(2,8))),
-                    receive_in_order(lists:seq(1,8))
+                    receive_in_order([{priority_test, N} || N <- lists:seq(1,8)])
                 end,
                 [{workers, 1}]).
 
@@ -275,10 +292,10 @@ stop_wait_for_workers_test() ->
   Daddy = self(),
   yamq_test:run(fun(Msg) -> timer:sleep(1000), Daddy ! Msg, ok end,
                 fun() ->
-                    yamq:enqueue("1", 1),
+                    yamq:enqueue({stop_wait_for_workers_test, 1}, 1),
                     timer:sleep(100),
                     yamq:stop(),
-                    receive_in_order(["1"])
+                    receive_in_order([{stop_wait_for_workers_test, 1}])
                 end).
 
 cover_test() ->
@@ -292,10 +309,44 @@ cover_test() ->
                     timer:sleep(100)
                 end).
 
+queue_test_() ->
+  Daddy = self(),
+  F = fun() ->
+          yamq_test:run(fun(X) -> Daddy ! X, ok end,
+                        fun() ->
+                            L = lists:foldl(
+                                  fun(N, Acc) ->
+                                      P  = random:uniform(8),
+                                      D  = random:uniform(5000),
+                                      ok = yamq:enqueue({queue_test, N},P,D),
+                                      [{queue_test, N}|Acc]
+                                  end, [], lists:seq(1, 1000)),
+                            'receive'(L)
+                        end, [{'workers', 8}])
+      end,
+  {timeout, 30, F}.
+
+init_test() ->
+  {ok, _} = yamq_dets_store:start_link("x.dets"),
+  lists:foreach(fun(N) ->
+                    K  = s2_time:stamp(),
+                    P  = random:uniform(8),
+                    D  = random:uniform(1000),
+                    ok = yamq_dets_store:put({K,P,D}, N)
+                end, lists:seq(1, 100)),
+  {ok, _} = yamq:start_link([{workers, 1}, {func, fun(_) -> ok end}, {store, yamq_dets_store}]),
+  ok = yamq:stop(),
+  ok = yamq_dets_store:stop().
+
+'receive'([]) -> ok;
+'receive'(L) ->
+  receive X ->
+      ?hence(lists:member(X, L)),
+      'receive'(L -- [X])
+  end.
+
 receive_in_order(L) ->
-  lists:foreach(fun(X) ->
-                    X = receive Y -> Y end
-                end, L).
+  lists:foreach(fun(X) -> X = receive Y -> Y end end, L).
 
 -endif.
 
