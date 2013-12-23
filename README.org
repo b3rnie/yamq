@@ -42,6 +42,7 @@ yamq_dets_store found in test/ for example.
 Some rough estimates can be found in test/perf1.erl
 
 * Example
+#+BEGIN_SRC Erlang
 %% start store, this one is found in test/
 {ok, _} = yamq_dets_store:start_link("foo.dets"),
 
@@ -62,4 +63,6 @@ ok = yamq:enqueue(bar, 8, 600000),
 %% stop queue, will block until ongoing tasks are
 %% finished, no new will be started even if they are due.
 ok = yamq:stop(),
+
+#+END_SRC
 
