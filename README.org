@@ -6,25 +6,22 @@ yamq:start_link([{store, S}, {func, F}, {workers, N}]).
 
 Store (S) is your store of that implements yamq_store interface.
 
-Function (F) has arity 1 and handles enqueued tasks. It must
-return 'ok'.
+Function (F) has arity 1 and handles enqueued tasks. It must return 'ok'.
 
-Workers (N) must be larger or equal to 1 and is the maximum
-number of ongoing tasks.
+Workers (N) must be larger or equal to 1 and is the maximum number of ongoing
+tasks.
 
 Items are enqueued with:
 yamq:enqueue(X,P)
 yamq:enqueue(X,P,D)
 
-Task (X) can be anything that the function supplied in
-start_link handles.
+Task (X) can be anything that the function supplied in start_link handles.
 
-Priority (P) must be between 1 and 8, if several tasks are
-due at the same time a lower priority will always be chosen
-before a higher one.
+Priority (P) must be between 1 and 8, if several tasks are due at the same time
+a lower priority will always be chosen before a higher one.
 
-Due (D) must be larger or equal to 0, a task will not be
-exexuted until this many milliseconds has passed.
+Due (D) must be larger or equal to 0, a task will not be exexuted until this
+many milliseconds has passed.
 
 * Internals
 Very brief:
