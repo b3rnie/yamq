@@ -1,0 +1,65 @@
+A work queue with the ability to set 'due' time on enqueued items.
+
+* Overview
+Queue is started with:
+yamq:start_link([{store, S}, {func, F}, {workers, N}]).
+
+Store (S) is your store of that implements yamq_store interface.
+
+Function (F) has arity 1 and handles enqueued tasks. It must
+return 'ok'.
+
+Workers (N) must be larger or equal to 1 and is the maximum
+number of ongoing tasks.
+
+Items are enqueued with:
+yamq:enqueue(X,P)
+yamq:enqueue(X,P,D)
+
+Task (X) can be anything that the function supplied in
+start_link handles.
+
+Priority (P) must be between 1 and 8, if several tasks are
+due at the same time a lower priority will always be chosen
+before a higher one.
+
+Due (D) must be larger or equal to 0, a task will not be
+exexuted until this many milliseconds has passed.
+
+* Internals
+Very brief:
+- Upon startup store is consulted in order to rebuild index
+- New items are written to store before they are executed
+- 8 priority levels, one ETS table (ordered_set) / level
+
+* Store
+A store is needed that supports these operations:
+get/1, put/2, delete/1, list/0
+
+yamq_dets_store found in test/ for example.
+
+* Performance
+Some rough estimates can be found in test/perf1.erl
+
+* Example
+%% start store, this one is found in test/
+{ok, _} = yamq_dets_store:start_link("foo.dets"),
+
+%% Define a function that handles tasks:
+Fun = fun(Task) -> do_something(Task) end,
+
+%% start queue, with a maximum of 8 concurrent tasks:
+{ok, _} = yamq:start_link([{store,   yamq_dets_store},
+                           {workers, 8},
+                           {func,    Fun}]),
+
+%% enqueue task 'foo' with priority 1 due now
+ok = yamq:enqueue(foo, 1),
+
+%% enqueue task 'bar' with priority 8 due in 10 minutes
+ok = yamq:enqueue(bar, 8, 600000),
+
+%% stop queue, will block until ongoing tasks are
+%% finished, no new will be started even if they are due.
+ok = yamq:stop(),
+

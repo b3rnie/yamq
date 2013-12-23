@@ -5,6 +5,7 @@
 
 %%%_* Module declaration ===============================================
 -module(yamq_dets_store).
+-behaviour(yamq_store).
 
 %%%_* Exports ==========================================================
 -export([ start_link/1
