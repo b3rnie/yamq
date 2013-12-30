@@ -1,5 +1,6 @@
 %% Very crude performance test to get a rough idea how many things we
 %% can keep track of and handle / second
+%%% @copyright Bjorn Jensen-Urstad 2013
 
 -module(perf1).
 

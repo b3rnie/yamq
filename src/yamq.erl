@@ -1,5 +1,7 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% @doc
+%%%
+%%%
 %%% @copyright Bjorn Jensen-Urstad 2013
 %%% @end
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -14,6 +16,7 @@
         , stop/0
         , enqueue/2
         , enqueue/3
+        , size/0
         ]).
 
 %% gen_server
@@ -30,12 +33,12 @@
 
 %%%_* Code =============================================================
 %%%_ * Types -----------------------------------------------------------
--record(s, { store = throw('store')
-           , func  = throw('func')
-           , spids = throw('spids')
-           , wpids = throw('wpids')
-           , wfree = throw('wfree')
-           , heads = throw('heads')
+-record(s, { store = throw(store)
+           , func  = throw(func)
+           , sreqs = []
+           , wpids = []
+           , wfree = throw(wfree)
+           , heads = throw(heads)
            }).
 
 %%%_ * API -------------------------------------------------------------
@@ -50,45 +53,52 @@ enqueue(X, P) ->
   enqueue(X, P, 0).
 
 %% @doc enqueue X with priority P and due in D ms
-enqueue(X, P, 0)
-  when P>=1, P=<8 ->
-  gen_server:call(?MODULE, {enqueue, X, P, 0}, infinity);
 enqueue(X, P, D)
   when (P>=1 andalso P=<8),
-       (is_integer(D) andalso D>0) ->
-  DMS = (s2_time:stamp() div 1000) + D,
-  gen_server:call(?MODULE, {enqueue, X, P, DMS}, infinity).
+       (is_integer(D) andalso D>=0) ->
+  gen_server:call(?MODULE, {enqueue, X, P, D}, infinity).
+
+%% @doc get size of queue
+size() ->
+  gen_server:call(?MODULE, size, infinity).
 
 %%%_ * gen_server callbacks --------------------------------------------
 init(Args) ->
   process_flag(trap_exit, true),
-  {ok, Func}    = s2_lists:assoc(Args, 'func'),
-  {ok, Store}   = s2_lists:assoc(Args, 'store'),
-  {ok, Workers} = s2_lists:assoc(Args, 'workers'),
+  {ok, Func}  = s2_lists:assoc(Args, func),
+  {ok, Store} = s2_lists:assoc(Args, store),
+  {ok, N}     = s2_lists:assoc(Args, workers),
   _     = q_init(),
   Heads = q_load(Store),
-  {ok, #s{ store    = Store
-         , func     = Func
-         , wpids    = []
-         , spids    = []
-         , wfree    = Workers
-         , heads    = Heads
-         }, wait(Workers, Heads)}.
+  ?info("~p items in queue", [q_size()]),
+  {ok, #s{ store = Store
+         , func  = Func
+         , wfree = N
+         , heads = Heads
+         }, wait(N, Heads)}.
 
 terminate(_Rsn, S) ->
+  SPids = lists:map(fun({Pid,_}) -> Pid end, S#s.sreqs),
+  ?info("waiting for ~p workers to finish", [length(S#s.wpids)]),
+  ?info("waiting for ~p enqueue requests to finish", [length(SPids)]),
   lists:foreach(fun(Pid) ->
                     receive {'EXIT', Pid, _Rsn} -> ok end
                 end,
-                S#s.wpids ++ [Pid || {Pid,_} <- S#s.spids]).
+                S#s.wpids ++ SPids).
 
-handle_call({enqueue, X, P, D}, From, #s{store=Store} = S) ->
+handle_call({enqueue, X, P, D0}, From, #s{store=Store} = S) ->
   %% k needs to be:
   %% * unique
   %% * monotonically increasing
-  K     = s2_time:stamp(),
-  Pid   = spawn_link(fun() -> ok = Store:put({K,P,D}, X) end),
-  SPids = [{Pid,{K,P,D,From}}|S#s.spids],
-  {noreply, S#s{spids=SPids}, wait(S#s.wfree, S#s.heads)};
+  K = s2_time:stamp(),
+  D = if D0 =:= 0 -> 0;
+         true     -> (K div 1000) + D0
+      end,
+  Pid   = erlang:spawn_link(fun() -> ok = Store:put({K,P,D}, X) end),
+  SReqs = [{Pid,{K,P,D,From}}|S#s.sreqs],
+  {noreply, S#s{sreqs=SReqs}, wait(S#s.wfree, S#s.heads)};
+handle_call(size, _From, S) ->
+  {reply, q_size(), S, wait(S#s.wfree, S#s.heads)};
 handle_call(stop, _From, S) ->
   {stop, normal, ok, S}.
 
@@ -96,11 +106,11 @@ handle_cast(Msg, S) ->
   {stop, {bad_cast, Msg}, S}.
 
 handle_info({'EXIT', Pid, normal}, S) ->
-  case lists:keytake(Pid, 1, S#s.spids) of
-    {value, {Pid, {K,P,D,From}}, SPids} ->
+  case lists:keytake(Pid, 1, S#s.sreqs) of
+    {value, {Pid, {K,P,D,From}}, SReqs} ->
       Heads = q_insert(K,P,D,S#s.heads),
       gen_server:reply(From, ok),
-      {noreply, S#s{spids = SPids,
+      {noreply, S#s{sreqs = SReqs,
                     heads = Heads}, wait(S#s.wfree, Heads)};
     false ->
       ?hence(lists:member(Pid, S#s.wpids)),
@@ -110,35 +120,36 @@ handle_info({'EXIT', Pid, normal}, S) ->
           {noreply, S#s{wpids = [NPid|S#s.wpids--[Pid]],
                         heads = Heads}, wait(S#s.wfree, Heads)};
         {error, empty} ->
-          WFree = S#s.wfree+1,
-          {noreply, S#s{wfree = WFree,
+          N = S#s.wfree + 1,
+          {noreply, S#s{wfree = N,
                         wpids = S#s.wpids--[Pid]
-                       }, wait(WFree, S#s.heads)}
+                       }, wait(N, S#s.heads)}
       end
   end;
 handle_info({'EXIT', Pid, Rsn}, S) ->
-  case lists:keytake(Pid, 1, S#s.spids) of
-    {value, {Pid, {_K,_P,_D,From}}, SPids} ->
+  case lists:keytake(Pid, 1, S#s.sreqs) of
+    {value, {Pid, {_K,_P,_D,From}}, SReqs} ->
       ?warning("writer died: ~p", [Rsn]),
       gen_server:reply(From, {error, Rsn}),
-      {stop, {store_failed, Rsn}, S#s{spids=SPids}};
+      {stop, {writer_failed, Rsn}, S#s{sreqs=SReqs}};
     false ->
       ?hence(lists:member(Pid, S#s.wpids)),
       ?warning("worker died: ~p", [Rsn]),
-      {stop, {worker_failed, Rsn}, S#s{wpids=S#s.wpids--[Pid]}}
+      {stop, {worker_failed, Rsn}, S#s{wfree = S#s.wfree-1,
+                                       wpids = S#s.wpids--[Pid]}}
   end;
 handle_info(timeout, S) ->
   ?hence(S#s.wfree > 0),
   case q_next(S#s.heads) of
     {ok, {{K,P,D},Heads}} ->
       Pid   = w_spawn(S#s.store, S#s.func, {K,P,D}),
-      WFree = S#s.wfree - 1,
+      N     = S#s.wfree - 1,
       WPids = [Pid|S#s.wpids],
-      {noreply, S#s{wfree = WFree,
+      {noreply, S#s{wfree = N,
                     wpids = WPids,
-                    heads = Heads}, wait(WFree, Heads)};
+                    heads = Heads}, wait(N, Heads)};
     {error, empty} ->
-      %% hmm..
+      ?warning("received a timeout but there is nothing to do"),
       {noreply, S, wait(S#s.wfree, S#s.heads)}
   end;
 handle_info(Msg, S) ->
@@ -149,9 +160,10 @@ code_change(_OldVsn, S, _Extra) ->
   {ok, S}.
 
 %%%_ * Internals gen_server util ---------------------------------------
-wait(0,      _Heads       ) -> infinity;
-wait(_WFree, []           ) -> infinity;
+wait(0,      _Heads       ) -> q_assert_heads(_Heads), infinity;
+wait(_WFree, []           ) -> q_assert_heads([]),     infinity;
 wait(_WFree, [{_QS,DS}|Hs]) ->
+  q_assert_heads([{_QS,DS}|Hs]),
   case lists:foldl(fun({_Q, D},Acc) when D < Acc -> D;
                       ({_Q,_D},Acc)              -> Acc
                    end, DS, Hs) of
@@ -160,7 +172,8 @@ wait(_WFree, [{_QS,DS}|Hs]) ->
   end.
 
 %%%_ * Internals queue -------------------------------------------------
--define(QS, ['q1', 'q2', 'q3', 'q4', 'q5', 'q6', 'q7', 'q8']).
+-define(QS, [yamq_q1, yamq_q2, yamq_q3, yamq_q4,
+             yamq_q5, yamq_q6, yamq_q7, yamq_q8]).
 
 q_init() ->
   lists:foreach(fun(Q) ->
@@ -202,25 +215,38 @@ q_take_next(Q, Heads0) ->
     {ND,_NK}        -> {ok, {{K,q_q2p(Q),D}, [{Q,ND}|Heads]}}
   end.
 
-%% queue to priority
-q_q2p('q1') -> 1;
-q_q2p('q2') -> 2;
-q_q2p('q3') -> 3;
-q_q2p('q4') -> 4;
-q_q2p('q5') -> 5;
-q_q2p('q6') -> 6;
-q_q2p('q7') -> 7;
-q_q2p('q8') -> 8.
+q_q2p(yamq_q1) -> 1;
+q_q2p(yamq_q2) -> 2;
+q_q2p(yamq_q3) -> 3;
+q_q2p(yamq_q4) -> 4;
+q_q2p(yamq_q5) -> 5;
+q_q2p(yamq_q6) -> 6;
+q_q2p(yamq_q7) -> 7;
+q_q2p(yamq_q8) -> 8.
 
-%% priority to queue
-q_p2q(1) -> 'q1';
-q_p2q(2) -> 'q2';
-q_p2q(3) -> 'q3';
-q_p2q(4) -> 'q4';
-q_p2q(5) -> 'q5';
-q_p2q(6) -> 'q6';
-q_p2q(7) -> 'q7';
-q_p2q(8) -> 'q8'.
+q_p2q(1) -> yamq_q1;
+q_p2q(2) -> yamq_q2;
+q_p2q(3) -> yamq_q3;
+q_p2q(4) -> yamq_q4;
+q_p2q(5) -> yamq_q5;
+q_p2q(6) -> yamq_q6;
+q_p2q(7) -> yamq_q7;
+q_p2q(8) -> yamq_q8.
+
+q_size() ->
+  lists:foldl(fun(Q,N) -> N + ets:info(Q, size) end, 0, ?QS).
+
+q_assert_heads(Heads0) ->
+  [] = lists:foldl(
+         fun(Q, Heads1) ->
+             case ets:first(Q) of
+               '$end_of_table' ->
+                 false = lists:keyfind(Q, 1, Heads1), Heads1;
+               {D,_K} ->
+                 {value, {Q,D}, Heads} = lists:keytake(Q, 1, Heads1),
+                 Heads
+             end
+         end, Heads0, ?QS).
 
 %%%_ * Internals workers -----------------------------------------------
 w_spawn(Store, Fun, {K,P,D}) ->
@@ -236,9 +262,7 @@ w_spawn(Store, Fun, {K,P,D}) ->
 -include_lib("eunit/include/eunit.hrl").
 
 basic_test() ->
-  Daddy = self(),
   yamq_test:run(
-    fun(Msg) -> Daddy ! Msg, ok end,
     fun() ->
         lists:foreach(fun(N) ->
                           ok = yamq:enqueue({basic, N}, N)
@@ -246,10 +270,18 @@ basic_test() ->
         'receive'([{basic, N} || N <- lists:seq(1,8)])
     end).
 
-delay1_test() ->
-  Daddy = self(),
+size_test() ->
   yamq_test:run(
-    fun(Msg) -> Daddy ! Msg, ok end,
+    fun() ->
+        0  = yamq:size(),
+        ok = yamq:enqueue({size, 1}, 1, 500),
+        1  = yamq:size(),
+        ok = yamq:enqueue({size, 2}, 4, 500),
+        2  = yamq:size()
+    end).
+
+delay1_test() ->
+  yamq_test:run(
     fun() ->
         ok = yamq:enqueue({delay, 1}, 1, 2000),
         ok = yamq:enqueue({delay, 2}, 1, 1000),
@@ -260,9 +292,7 @@ delay1_test() ->
     end).
 
 delay2_test() ->
-  Daddy = self(),
   yamq_test:run(
-    fun(Msg) -> Daddy ! Msg, ok end,
     fun() ->
         ok = yamq:enqueue({delay2, 1}, 1, 3000),
         receive _ -> exit(fail) after 2500 -> ok end,
@@ -272,7 +302,6 @@ delay2_test() ->
 priority_test() ->
   Daddy = self(),
   yamq_test:run(
-    fun(Msg) -> timer:sleep(400), Daddy ! Msg,ok end,
     fun() ->
         yamq:enqueue({priority_test, 1}, 1),
         timer:sleep(100),
@@ -280,23 +309,22 @@ priority_test() ->
                           yamq:enqueue({priority_test,P},P)
                       end, lists:reverse(lists:seq(2,8))),
         receive_in_order([{priority_test, N} || N <- lists:seq(1,8)])
-    end,
-    [{workers, 1}]).
+    end, [{func, fun(X) -> timer:sleep(400), Daddy ! X, ok end},
+          {workers, 1}]).
 
 stop_wait_for_workers_test() ->
   Daddy = self(),
   yamq_test:run(
-    fun(Msg) -> timer:sleep(1000), Daddy ! Msg, ok end,
     fun() ->
         yamq:enqueue({stop_wait_for_workers_test, 1}, 1),
         timer:sleep(100),
         yamq:stop(),
         receive_in_order([{stop_wait_for_workers_test, 1}])
-    end).
+    end,
+    [{func, fun(Msg) -> timer:sleep(1000), Daddy ! Msg, ok end}]).
 
 cover_test() ->
   yamq_test:run(
-    fun(_) -> ok end,
     fun() ->
         yamq ! foo,
         yamq ! timeout,
@@ -304,13 +332,11 @@ cover_test() ->
         ok = sys:change_code(yamq, yamq, 0, []),
         ok = sys:resume(yamq),
         timer:sleep(100)
-    end).
+    end, [{func, fun(X) -> exit(X) end}]).
 
 queue_test_() ->
-  Daddy = self(),
   F = fun() ->
           yamq_test:run(
-            fun(X) -> Daddy ! X, ok end,
             fun() ->
                 L = lists:foldl(
                       fun(N, Acc) ->
@@ -359,7 +385,7 @@ store_fail_test() ->
                                 {store, yamq_dets_store}]),
   ok         = yamq_dets_store:stop(),
   {error, _} = yamq:enqueue(store_fail_test, 1),
-  receive {'EXIT', Pid, {store_failed, _}} -> ok end,
+  receive {'EXIT', Pid, {writer_failed, _}} -> ok end,
   erlang:process_flag(trap_exit, false),
   ok.
 
