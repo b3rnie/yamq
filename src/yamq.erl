@@ -94,7 +94,12 @@ handle_call({enqueue, X, P, D0}, From, #s{store=Store} = S) ->
   D = if D0 =:= 0 -> 0;
          true     -> (K div 1000) + D0
       end,
-  Pid   = erlang:spawn_link(fun() -> ok = Store:put({K,P,D}, X) end),
+  Pid   = erlang:spawn_link(fun() ->
+                                case Store:put({K,P,D}, X) of
+                                  ok           -> ok;
+                                  {error, Rsn} -> exit(Rsn)
+                                end
+                            end),
   SReqs = [{Pid,{K,P,D,From}}|S#s.sreqs],
   {noreply, S#s{sreqs=SReqs}, wait(S#s.wfree, S#s.heads)};
 handle_call(size, _From, S) ->
@@ -160,10 +165,9 @@ code_change(_OldVsn, S, _Extra) ->
   {ok, S}.
 
 %%%_ * Internals gen_server util ---------------------------------------
-wait(0,      _Heads       ) -> q_assert_heads(_Heads), infinity;
-wait(_WFree, []           ) -> q_assert_heads([]),     infinity;
+wait(0,      _Heads       ) -> infinity;
+wait(_WFree, []           ) -> infinity;
 wait(_WFree, [{_QS,DS}|Hs]) ->
-  q_assert_heads([{_QS,DS}|Hs]),
   case lists:foldl(fun({_Q, D},Acc) when D < Acc -> D;
                       ({_Q,_D},Acc)              -> Acc
                    end, DS, Hs) of
@@ -235,18 +239,6 @@ q_p2q(8) -> yamq_q8.
 
 q_size() ->
   lists:foldl(fun(Q,N) -> N + ets:info(Q, size) end, 0, ?QS).
-
-q_assert_heads(Heads0) ->
-  [] = lists:foldl(
-         fun(Q, Heads1) ->
-             case ets:first(Q) of
-               '$end_of_table' ->
-                 false = lists:keyfind(Q, 1, Heads1), Heads1;
-               {D,_K} ->
-                 {value, {Q,D}, Heads} = lists:keytake(Q, 1, Heads1),
-                 Heads
-             end
-         end, Heads0, ?QS).
 
 %%%_ * Internals workers -----------------------------------------------
 w_spawn(Store, Fun, {K,P,D}) ->
