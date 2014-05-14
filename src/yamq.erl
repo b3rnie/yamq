@@ -64,7 +64,7 @@ enqueue(Task) ->
   enqueue(Task, []).
 
 enqueue(Task, Options) ->
-  gen_server:call(?MODULE, {enqueue, Task, Options}, infinity).
+  gen_server:call(?MODULE, {enqueue, Task, opt_parse(Options)}, infinity).
 
 size() ->
   gen_server:call(?MODULE, size, infinity).
@@ -159,7 +159,10 @@ handle_info(Msg, S) ->
 code_change(_OldVsn, S, _Extra) ->
   {ok, S}.
 
-%%%_ * Internals gen_server util ---------------------------------------
+%%%_ * Internals queue -------------------------------------------------
+-define(QS, [yamq_q1, yamq_q2, yamq_q3, yamq_q4,
+             yamq_q5, yamq_q6, yamq_q7, yamq_q8]).
+
 wait(0,      _Heads       ) -> infinity;
 wait(_WFree, []           ) -> infinity;
 wait(_WFree, [{_QS,DS}|Hs]) ->
@@ -169,10 +172,6 @@ wait(_WFree, [{_QS,DS}|Hs]) ->
     0   -> 0;
     Min -> lists:max([0, (Min - s2_time:stamp() div 1000)+1])
   end.
-
-%%%_ * Internals queue -------------------------------------------------
--define(QS, [yamq_q1, yamq_q2, yamq_q3, yamq_q4,
-             yamq_q5, yamq_q6, yamq_q7, yamq_q8]).
 
 q_init() ->
   lists:foreach(fun(Q) ->
@@ -207,7 +206,7 @@ q_next(Heads0, Blocked0) ->
   end.
 
 q_pick(Ready) ->
-  [{Q,_}|_] = lists:sort(Ready),
+  [{Q,_}|_] = lists:sort(Ready), %pick highest priority
   Q.
 
 q_take_next(Q, Heads0) ->
@@ -258,30 +257,46 @@ q_size(Blocked) ->
   dict:fold(fun(_S,L,N) -> N + length(L) end, 0, Blocked) +
     lists:foldl(fun(Q,N) -> N + ets:info(Q, size) end, 0, ?QS).
 
+%%%_ * Internals options -----------------------------------------------
+opt_parse(Options) ->
+  lists:ukeysort(1, lists:map(fun opt_validate/1, Options) ++ opt_def()).
+
+opt_validate({priority, P})
+  when P >=1, P=<8           -> {priority, P};
+opt_validate({due, 0})       -> {due, 0};
+opt_validate({due, D})
+  when is_integer(D), D>0    -> {due, D + (s2_time:stamp() div 1000)};
+opt_validate({serialize, S})
+  when S =/= []              -> {serialize, S}.
+
+opt_def() ->
+  [{priority,  8},
+   {due,       0},
+   {serialize, []}
+  ].
+
 %%%_ * Internals workers/storage ---------------------------------------
 spawn_worker(Store, Fun, Info) ->
+  Daddy = erlang:self(),
   erlang:spawn_link(
     fun() ->
         {ok, Task} = Store:get(Info),
         ok         = Fun(Task),
         ok         = Store:delete(Info),
-        ok         = gen_server:cast(?MODULE, {done, {erlang:self(), Info}}),
-        ok
+        ok         = gen_server:cast(Daddy, {done, {erlang:self(), Info}})
     end).
 
 spawn_store(Store, Task, Options, From) ->
+  Daddy = erlang:self(),
   erlang:spawn_link(
     fun() ->
-        Info = {s2_time:stamp(),
-                s2_lists:assoc(Options, priority,  8),
-                case s2_lists:assoc(Options, due) of
-                  {error, notfound} -> 0;
-                  {ok, N}           -> N + (s2_time:stamp() div 1000)
-                end,
-                s2_lists:assoc(Options, serialize, [])},
+        {ok, Priority}  = s2_lists:assoc(Options, priority),
+        {ok, Due}       = s2_lists:assoc(Options, due),
+        {ok, Serialize} = s2_lists:assoc(Options, serialize),
+        Info            = {s2_time:stamp(), Priority, Due, Serialize},
         ok   = Store:put(Info, Task),
-        ok   = gen_server:cast(?MODULE, {enqueued, {erlang:self(), Info}}),
-        _    = gen_server:reply(From, ok)
+        ok   = gen_server:cast(Daddy, {enqueued, {erlang:self(), Info}}),
+        _    = gen_server:reply(From, ok) %tell caller we are done
     end).
 
 %%%_* Tests ============================================================
@@ -433,6 +448,15 @@ serialize_test() ->
                  end},
           {workers, 4}
          ]).
+
+bad_options_test() ->
+  yamq_test:run(
+    fun() ->
+        {'EXIT', _} = (catch yamq:enqueue(foo, [{due, -1}])),
+        {'EXIT', _} = (catch yamq:enqueue(bar, [{serialize, []}])),
+        {'EXIT', _} = (catch yamq:enqueue(baz, [{priority, 0}])),
+        {'EXIT', _} = (catch yamq:enqueue(buz, [{priority, 9}]))
+    end).
 
 'receive'([]) -> ok;
 'receive'(L) ->
