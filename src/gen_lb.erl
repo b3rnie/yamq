@@ -90,9 +90,9 @@ init(Args) ->
   {ok, Cluster} = s2_lists:assoc(Args, cluster),
   {ok, CbMod}   = s2_lists:assoc(Args, cb_mod),
   {ok, TRef}    = timer:send_interval(1000, maybe_unblock),
-  {ok, #s{ cluster_up   = [{Node,[]} || Node <- Cluster]
-         , cb_mod       = CbMod
-         , tref         = TRef
+  {ok, #s{ cluster_up = [{Node,[]} || Node <- Cluster]
+         , cb_mod     = CbMod
+         , tref       = TRef
          }}.
 
 terminate(_Rsn, S) ->
@@ -152,33 +152,30 @@ handle_info({'EXIT', Pid, {Type, Rsn}}, S)
   Reqs  = dict:erase(Pid, S#s.reqs),
   Up0   = cluster_add_failure(S#s.cluster_up, Req0#r.node, Type),
   {Up1, Down} = cluster_maybe_block(Up0, S#s.cluster_down),
-  case Req0#r.attempts < ?CALL_ATTEMPTS of
-    true ->
+  case {Req0#r.attempts < ?CALL_ATTEMPTS, Up1} of
+    {true, []} ->
+      %% everything is down
+      gen_server:reply(Req0#r.from, {error, Rsn}),
+      {noreply, S#s{ cluster_up   = Up1
+                   , cluster_down = Down
+                   , reqs         = Reqs}};
+    {true, Up1} ->
       %% make sure we dont hit the same node twice in a row
-      Up2 = case Up1 of
-              [{Node1,Info1},{Node2,Info2}|Nodes]
-                when Node1 =:= Req0#r.node ->
-                [{Node2,Info2},{Node1,Info1}|Nodes];
-              Up1 -> Up1
-            end,
-      case Up2 of
-        [] ->
-          %% everything is down
-          gen_server:reply(Req0#r.from, {error, Rsn}),
-          {noreply, S#s{ cluster_up   = Up1 %no need to use reordered
-                       , cluster_down = Down
-                       , reqs         = Reqs}};
-        [{Node,Info}|Up] ->
-          NewPid = do_call(S#s.cb_mod, Req0#r.args, Req0#r.from, Node),
-          Req = Req0#r{ attempts = Req0#r.attempts + 1
-                      , node     = Node
-                      },
-          {noreply, S#s{ cluster_up   = Up ++ [{Node,Info}] %round robin
-                       , cluster_down = Down
-                       , reqs         = dict:store(NewPid, Req, Reqs)
-                       }}
-      end;
-    false ->
+      [{Node,Info}|Up] =
+        case Up1 of
+          [{N1,I1},{N2,I2}|Ns]
+            when N1 =:= Req0#r.node -> [{N2,I2},{N1,I1}|Ns];
+          Up1                       -> Up1
+        end,
+      NewPid = do_call(S#s.cb_mod, Req0#r.args, Req0#r.from, Node),
+      Req = Req0#r{ attempts = Req0#r.attempts + 1
+                  , node     = Node
+                  },
+      {noreply, S#s{ cluster_up   = Up ++ [{Node,Info}] %round robin
+                   , cluster_down = Down
+                   , reqs         = dict:store(NewPid, Req, Reqs)
+                   }};
+    {false, _} ->
       gen_server:reply(Req0#r.from, {error, Rsn}),
       {noreply, S#s{ cluster_up   = Up1
                    , cluster_down = Down
