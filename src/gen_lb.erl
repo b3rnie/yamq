@@ -62,7 +62,7 @@
            }).
 
 -record(s, { cluster_up   = throw(cluster_up)
-           , cluster_down = throw(cluster_down)
+           , cluster_down = []
            , cb_mod       = throw(cb_mod)
            , tref         = throw(tref)
            , reqs         = dict:new()
@@ -91,7 +91,6 @@ init(Args) ->
   {ok, CbMod}   = s2_lists:assoc(Args, cb_mod),
   {ok, TRef}    = timer:send_interval(1000, maybe_unblock),
   {ok, #s{ cluster_up   = [{Node,[]} || Node <- Cluster]
-         , cluster_down = []
          , cb_mod       = CbMod
          , tref         = TRef
          }}.
@@ -116,7 +115,8 @@ handle_call({block, Node}, _From, S) ->
   case lists:keytake(Node, 1, S#s.cluster_up) of
     {value, {Node, _Info}, Up} ->
       {reply, ok, S#s{ cluster_up   = Up
-                     , cluster_down = [{Node,inf}|S#s.cluster_down]}};
+                     , cluster_down = [{Node,inf}|S#s.cluster_down]
+                     }};
     false ->
       case lists:keytake(Node, 1, S#s.cluster_down) of
         {value, {Node, _Time}, Down} ->
@@ -129,7 +129,8 @@ handle_call({unblock, Node}, _From, S) ->
   case lists:keytake(Node, 1, S#s.cluster_down) of
     {value, {Node, _Time}, Down} ->
       {reply, ok, S#s{ cluster_up   = [{Node,[]}|S#s.cluster_up]
-                     , cluster_down = Down}};
+                     , cluster_down = Down
+                     }};
     false ->
       case lists:keymember(Node, 1, S#s.cluster_up) of
         true  -> {reply, {error, not_blocked}, S};
@@ -150,22 +151,21 @@ handle_info({'EXIT', Pid, {Type, Rsn}}, S)
   Req0  = dict:fetch(Pid, S#s.reqs),
   Reqs  = dict:erase(Pid, S#s.reqs),
   Up0   = cluster_add_failure(S#s.cluster_up, Req0#r.node, Type),
-  Up1   = cluster_prune_failures(Up0),
-  {Up2, Down} = cluster_maybe_block(Up1, S#s.cluster_down),
+  {Up1, Down} = cluster_maybe_block(Up0, S#s.cluster_down),
   case Req0#r.attempts < ?CALL_ATTEMPTS of
     true ->
       %% make sure we dont hit the same node twice in a row
-      Up3 = case Up2 of
+      Up2 = case Up1 of
               [{Node1,Info1},{Node2,Info2}|Nodes]
                 when Node1 =:= Req0#r.node ->
                 [{Node2,Info2},{Node1,Info1}|Nodes];
-              Up2 -> Up2
+              Up1 -> Up1
             end,
-      case Up3 of
+      case Up2 of
         [] ->
           %% everything is down
           gen_server:reply(Req0#r.from, {error, Rsn}),
-          {noreply, S#s{ cluster_up   = Up2 %no need to use reordered
+          {noreply, S#s{ cluster_up   = Up1 %no need to use reordered
                        , cluster_down = Down
                        , reqs         = Reqs}};
         [{Node,Info}|Up] ->
@@ -180,7 +180,7 @@ handle_info({'EXIT', Pid, {Type, Rsn}}, S)
       end;
     false ->
       gen_server:reply(Req0#r.from, {error, Rsn}),
-      {noreply, S#s{ cluster_up   = Up2
+      {noreply, S#s{ cluster_up   = Up1
                    , cluster_down = Down
                    , reqs         = Reqs
                    }}
@@ -223,23 +223,18 @@ do_call(CbMod, Args, From, Node) ->
     end).
 
 cluster_add_failure(Up, Node, Type) ->
-  case lists:keyfind(Node, 1, Up) of
-    {Node, Info} ->
-      Now = s2_time:stamp() div 1000,
-      lists:keyreplace(Node, 1, Up, {Node, [{Type, Now}|Info]});
-    false ->
-      %% already blocked
-      Up
-  end.
-
-cluster_prune_failures(Up0) ->
-  Then = (s2_time:stamp() div 1000) - ?AUTOBLOCK_INTERVAL * 1000,
-  lists:map(fun({Node, Info}) ->
-                {Node, lists:filter(
-                         fun({_Type,  Time}) when Time < Then -> false;
-                            ({_Type, _Time})                  -> true
-                         end, Info)}
-            end, Up0).
+  Now  = s2_time:stamp() div 1000,
+  Then = Now - ?AUTOBLOCK_INTERVAL * 1000,
+  lists:map(
+    fun({N, Info0}) ->
+        %% prune
+        Info = lists:filter(fun({_Type, Time}) when Time < Then -> false;
+                               ({_Type, _Time})                 -> true
+                            end, Info0),
+        if Node =:= N -> {N, [{Type,Now}|Info]};
+           true       -> {N, Info} %already blocked
+        end
+    end, Up).
 
 cluster_maybe_block(Up0, Down) ->
   {Up, NewDown} =
@@ -248,10 +243,12 @@ cluster_maybe_block(Up0, Down) ->
           case lists:foldl(fun({call_error, _}, {E,C}) -> {E+1,C};
                               ({call_crash, _}, {E,C}) -> {E,  C+1}
                            end, {0, 0}, Info) of
-            {E, _C} when E >= ?AUTOBLOCK_ERRORS ->
+            {E, _C} when E >= ?AUTOBLOCK_ERRORS andalso
+                         0 /= ?AUTOBLOCK_ERRORS ->
               ?warning("blocking ~p (too many errors)", [Node]),
               false;
-            {_E, C} when C >= ?AUTOBLOCK_CRASHES ->
+            {_E, C} when C >= ?AUTOBLOCK_CRASHES andalso
+                         0 /= ?AUTOBLOCK_CRASHES ->
               ?warning("blocking ~p (too many crasches)", [Node]),
               false;
             {_, _} ->
