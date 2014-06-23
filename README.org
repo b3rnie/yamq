@@ -1,65 +1,160 @@
-A work queue with the ability to set 'due' time on enqueued items.
-
 * Overview
-Queue is started with:
-yamq:start_link([{store, S}, {func, F}, {workers, N}]).
+Small collection of utilities that hasn't yet justified their own repositories.
+** gen_lb
+A simple loadbalancer / circuitbreaker
 
-Store (S) is your store of that implements yamq_store interface.
+Used between services in a SOA, loadbalances requests over multiple nodes,
+automatically removes failing nodes and stops cascading failures.
 
-Function (F) has arity 1 and handles enqueued tasks. It must return 'ok'.
+*** Example
+#+BEGIN_SRC Erlang
+{ok, _} = gen_lb:start_link(service_x,
+                            [ %% nodes in this cluster
+                              {cluster, ["node1","node2","node3"]}
+                              %% module implementing the actual code
+                              %% communicating with cluster
+                            , {cb_mod, testmod}
+                              %% interval upon which failures are
+                              %% calculated (ms)
+                            , {interval, 600000} %10 min
+                              %% max errors during interval that a node can
+                              %% experience before being taken out of rotation
+                            , {max_errors, 2}
+                              %% max crasches during interval that a node can
+                              %% experience before being taken out of rotation
+                            , {max_crasches, 1}
+                              %% Time a blocked node will be kept out of cluster
+                              %% before being automatically inserted again
+                            , {block_time, 300000} %5 min
+                            ]),
 
-Workers (N) must be larger or equal to 1 and is the maximum number of ongoing
-tasks.
+%% call service_x that can be handled by node[123]. gen_lb keeps track
+%% of crasches, failures, load-balancing etc.
+case gen_lb:call(service_x, do_something,
+                 [ %% do up to two attempts (ie: if the first fail do another).
+                   %% multiple attempts will always hit atleast two nodes
+                   {attempts, 2}
+                 ]) of
+  {ok, Res} ->
+    %% everything went good
+    {ok, Res};
+  {error, cluster_down} ->
+    %% all nodes in the cluster are down (previous crasches/errors)
+    %% nothing we can do except wait until they are automatically reinserted
+    {error, cluster_down};
+  {error, Rsn} ->
+    %% call failed for whatever reason.
+    %% the failure is stored in gen_lb and might result in node being taken
+    %% out of rotation
+    {error, Rsn}
+end.
 
-Items are enqueued with:
-yamq:enqueue(X,P)
-yamq:enqueue(X,P,D)
+%% manually block a node (infinite time)
+gen_lb:block(service_x, "node1").
 
-Task (X) can be anything that the function supplied in start_link handles.
+%% manually unblock a node
+gen_lb:unblock(service_x, "node1").
+#+END_SRC
 
-Priority (P) must be between 1 and 8, if several tasks are due at the same time
-a lower priority will always be chosen before a higher one.
+Callback module testmod.erl
+#+BEGIN_SRC Erlang
+-module(testmod).
+-behaviour(gen_lb).
 
-Due (D) must be larger or equal to 0, a task will not be exexuted until this
-many milliseconds has passed.
+-export([exec/2]).
 
-* Internals
+exec(Node, Args) ->
+  %% do the actual call to the node selected by gen_lb
+  case do_something(Node, Args) of
+    {ok, Res} ->
+      {ok, Res};
+    {error, Rsn} ->
+      %% we failed, this will increment number of errors on this node.
+      %% request will possibly be retried with another node
+      {error, Rsn}
+  end.
+#+END_SRC
+
+*** Todo
+All requests go through a gen_server, nodes can be kept in an ETS-table
+in order to avoid this.
+
+Better support for timeouts
+
+More metrics
+
+** yamq
+A persistant priority queue with the ability to set 'due' time on enqueued items.
+
+*** Example
+#+BEGIN_SRC Erlang
+%% start your storage backend (postgres/riak/ETS/etc)
+%% for this example we use a gen_server keeping track of a dets table. Source
+%% is found in test/
+{ok, _} = yamq_dets_store:start_link("foo.dets"),
+
+%% define a function that does something with enqueued items
+F = fun(Task) ->
+      io:format("got a task ~p", [Task]),
+      do_something(Task)
+    end,
+
+{ok, _} = yamq:start_link([ {store, yamq_dets_store}
+                            %% function that will be executed for enqueued
+                            %% tasks
+                          , {func, F}
+                            %% number of concurrent workers
+                          , {workers, 4}
+                          ]),
+
+%% enqueue a task with priority 1 that will be handled as soon as
+%% there is a worker thread ready
+ok = yamq:enqueue(foo, [{priority, 1}]),
+
+%% enqueue a task with priority 8 that will be handled in 10minutes or later
+ok = yamq:enqueue(bar, [{priority, 8}, {due, 600000}]),
+
+%% enqueue three tasks and make sure they are executed in serial
+SerializeID = 123456789,
+ok = yamq:enqueue(baz, [{serialize, SerializeID}]),
+ok = yamq:enqueue(buz, [{serialize, SerializeID}]),
+ok = yamq:enqueue(bar, [{serialize, SerializeID}]),
+
+%% stop queue
+ok = yamq:stop(),
+#+END_SRC
+
+*** Internals
 Very brief:
 - Upon startup store is consulted in order to rebuild index
 - New items are written to store before they are executed
 - 8 priority levels, one ETS table (ordered_set) / level
 
-* Store
-A store is needed that supports these operations:
-get/1, put/2, delete/1, list/0
-
-yamq_dets_store found in test/ for example.
-
-* Performance
-Some rough estimates can be found in test/perf1.erl
-
-* Example
+*** Store
+Needs to look somewhat like this
 #+BEGIN_SRC Erlang
-%% start store, this one is found in test/
-{ok, _} = yamq_dets_store:start_link("foo.dets"),
+-module(yamq_store_impl).
+-behaviour(yamq_store).
 
-%% Define a function that handles tasks:
-Fun = fun(Task) -> do_something(Task) end,
+-export([ get/1
+        , put/2
+        , delete/1
+        , list/0
+        ]).
 
-%% start queue, with a maximum of 8 concurrent tasks:
-{ok, _} = yamq:start_link([{store,   yamq_dets_store},
-                           {workers, 8},
-                           {func,    Fun}]),
-
-%% enqueue task 'foo' with priority 1 due now
-ok = yamq:enqueue(foo, 1),
-
-%% enqueue task 'bar' with priority 8 due in 10 minutes
-ok = yamq:enqueue(bar, 8, 600000),
-
-%% stop queue, will block until ongoing tasks are
-%% finished, no new will be started even if they are due.
-ok = yamq:stop(),
-
+get(K)    -> {ok, V}.
+put(K,V)  -> ok.
+delete(K) -> ok.
+list()    -> {ok, []}.
 #+END_SRC
+
+*** Performance
+Some rough estimates can be found in test/perf1.erl.
+
+My thinkpad x230 handled several million entries with a due time from now to
++6 months without any problems which is more than good enough for my
+usecase.
+
+
+
 
